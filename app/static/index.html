@@ -705,6 +705,61 @@ X999, 2026-09-18 08:10:00, 中心公园, 进"></textarea>
       </div>
     </section>
 
+    <!-- 服务中断补偿预览 -->
+    <section class="card" id="sec-compensation">
+      <h2>16. 服务中断补偿预览</h2>
+      <p class="hint">基于<strong>最近一次核验生成的账单</strong>（第 7 区）预览服务中断补偿：
+        输入中断<strong>站点</strong>、<strong>起止时刻</strong>（闭区间）、<strong>补偿预算</strong>与
+        <strong>单卡上限</strong>（金额单位：元，计算时按分取整）。系统选出<strong>进站或出站</strong>
+        发生在该站、且对应刷卡时刻落在闭区间内的行程，按卡汇总实扣额；先以各卡实扣额为
+        <strong>权重</strong>按比例分配预算，再将超过 <code>min(单卡上限, 该卡实扣额)</code> 的份额
+        <strong>封顶</strong>并向未封顶卡<strong>重新分配</strong>；每轮按<strong>最大余数</strong>补齐整数分
+        （余数相同按卡号排序），直到预算用尽或全部封顶。预览<strong>全程只读</strong>：
+        不修改记录、配置或账单；无匹配账单时返回空结果。</p>
+      <div class="form-grid">
+        <label>中断站点
+          <input type="text" id="comp-station" placeholder="科技园" />
+        </label>
+        <label>开始时刻（含）
+          <input type="text" id="comp-start" placeholder="2026-09-18 08:00:00" />
+        </label>
+        <label>结束时刻（含）
+          <input type="text" id="comp-end" placeholder="2026-09-18 09:00:00" />
+        </label>
+        <label>补偿预算（元）
+          <input type="number" id="comp-budget" min="0" step="0.01" value="12.00" />
+        </label>
+        <label>单卡上限（元）
+          <input type="number" id="comp-cap" min="0" step="0.01" value="2.00" />
+        </label>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" id="btn-comp" type="button">💸 生成补偿预览</button>
+        <span id="comp-status" class="status"></span>
+      </div>
+
+      <div id="comp-errors" class="errors-panel" hidden>
+        <h3>❌ 无法生成补偿预览 —— 请修正以下参数（记录、配置与账单均未改动）</h3>
+        <ul id="comp-errors-list"></ul>
+      </div>
+
+      <div id="comp-result" class="audit-result" hidden>
+        <div id="comp-summary" class="audit-summary"></div>
+        <div class="table-wrap">
+          <table id="comp-table">
+            <thead>
+              <tr>
+                <th>卡号</th><th>受影响行程数</th><th>实扣额（元）</th>
+                <th>补偿额（元）</th><th>未补偿（元）</th><th>有效上限（元）</th>
+                <th>封顶状态</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <footer class="footer">
       FastAPI + SQLite + 原生前端 · 数据保存在容器 /data 卷 ·
       <a href="/docs" target="_blank">API 文档</a>

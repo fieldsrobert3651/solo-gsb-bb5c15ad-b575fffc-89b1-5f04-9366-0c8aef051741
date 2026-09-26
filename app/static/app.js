@@ -1798,6 +1798,124 @@ function copyDisputeSummary() {
   copyText(lastDisputeText, "已复制争议摘要（预演为只读，未写回任何数据）");
 }
 
+/* ---------------- 16. 服务中断补偿预览（只读） ---------------- */
+
+function renderCompErrors(errors) {
+  const ul = $("comp-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("comp-errors").hidden = false;
+  $("comp-result").hidden = true;
+}
+
+function compCapTag(c) {
+  if (!c.capped) return '<span class="tag tag-same">未封顶</span>';
+  return c.cap_reason === "cap"
+    ? '<span class="tag tag-flip">已封顶（单卡上限）</span>'
+    : '<span class="tag tag-flip">已封顶（实扣额）</span>';
+}
+
+function renderCompensation(data) {
+  $("comp-errors").hidden = true;
+  $("comp-result").hidden = false;
+
+  const summary = $("comp-summary");
+  if (!data.card_count) {
+    summary.innerHTML =
+      `站点 <strong>${escapeHtml(data.station)}</strong> · 区间 ` +
+      `<strong>${data.start_time} ～ ${data.end_time}</strong>（闭区间）内` +
+      `没有匹配的账单行程（可能尚未核验或该时段无进出站刷卡）。<br>` +
+      `预算 <strong>${yuan(data.budget)}</strong> 元全额未分配 ` +
+      `（未分配 <strong>${yuan(data.unallocated)}</strong> 元）。<br>` +
+      `<span class="sub">预览全程只读：未修改记录、配置或账单。</span>`;
+  } else {
+    summary.innerHTML =
+      `站点 <strong>${escapeHtml(data.station)}</strong> · 区间 ` +
+      `<strong>${data.start_time} ～ ${data.end_time}</strong>（闭区间）· ` +
+      `账单核验时间 <strong>${escapeHtml(data.last_verified_at || "未知")}</strong>：` +
+      `匹配 <strong>${data.trip_count}</strong> 笔行程 / ` +
+      `<strong>${data.card_count}</strong> 张卡，实扣合计 ` +
+      `<strong>${yuan(data.charged_total)}</strong> 元；预算 ` +
+      `<strong>${yuan(data.budget)}</strong> 元（单卡上限 ` +
+      `${yuan(data.per_card_cap)} 元）经 <strong>${data.round_count}</strong> 轮分配，` +
+      `补偿合计 <strong>${yuan(data.compensated_total)}</strong> 元，` +
+      `未分配 <strong>${yuan(data.unallocated)}</strong> 元。<br>` +
+      `<span class="sub">按各卡实扣额（整数分）为权重比例分配，每轮最大余数补齐整数分` +
+      `（余数相同按卡号排序），超过 min(单卡上限, 实扣额) 的份额封顶并向未封顶卡重新分配；` +
+      `预览全程只读：未修改记录、配置或账单。</span>`;
+  }
+
+  const tb = $("comp-table").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const c of data.cards || []) {
+    const tr = document.createElement("tr");
+    if (c.capped) tr.classList.add("comp-capped-row");
+    tr.innerHTML = `
+      <td>${escapeHtml(c.card)}</td>
+      <td class="num">${c.trip_count}</td>
+      <td class="num">${yuan(c.charged_total)}</td>
+      <td class="num charge">${yuan(c.compensation)}</td>
+      <td class="num">${yuan(c.uncompensated)}</td>
+      <td class="num">${yuan(c.effective_cap)}</td>
+      <td>${compCapTag(c)}</td>`;
+    tb.appendChild(tr);
+  }
+  if (!(data.cards || []).length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td colspan="7" class="od-empty">无匹配账单行程，补偿预算全额未分配。</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function runCompensationPreview() {
+  const status = $("comp-status");
+  const body = {
+    station: $("comp-station").value.trim(),
+    start_time: $("comp-start").value.trim(),
+    end_time: $("comp-end").value.trim(),
+    budget: Number($("comp-budget").value),
+    per_card_cap: Number($("comp-cap").value),
+  };
+  if (!body.station || !body.start_time || !body.end_time) {
+    status.textContent = "请填写中断站点与起止时刻";
+    status.className = "status bad";
+    return;
+  }
+  if (!Number.isFinite(body.budget) || !Number.isFinite(body.per_card_cap)) {
+    status.textContent = "补偿预算与单卡上限必须填写为有效数字（元）";
+    status.className = "status bad";
+    return;
+  }
+  status.textContent = "分配试算中…";
+  status.className = "status";
+  $("comp-errors").hidden = true;
+  $("comp-result").hidden = true;
+  try {
+    const data = await api("/api/compensation-preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderCompensation(data);
+    status.textContent = data.card_count
+      ? `预览完成：${data.card_count} 张卡补偿合计 ${yuan(data.compensated_total)} 元，` +
+        `未分配 ${yuan(data.unallocated)} 元（只读，数据均未改动）`
+      : "预览完成：无匹配账单行程，预算全额未分配（只读，数据均未改动）";
+    status.className = "status ok";
+    toast("补偿预览已生成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderCompErrors(errors);
+      status.textContent = `存在 ${errors.length} 个参数错误，未生成预览（数据均未改动）`;
+    } else {
+      status.textContent = summaryError(e, "补偿预览请求失败");
+    }
+    status.className = "status bad";
+    toast("无法生成补偿预览", false);
+  }
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1859,6 +1977,16 @@ async function loadDemo() {
   $("dispute-line-1").value = "10";
   $("dispute-time-1").value = "";
   $("dispute-station-1").value = "大学城";
+  // 顺带填入服务中断补偿示例：科技园 07:56～08:10 中断，预算 12 元、
+  // 单卡上限 2 元 —— 命中 A001/C003/D004/E005/F006/G007 共 6 卡进站
+  // （07:56 与 08:00 边界时刻均计入，闭区间）；第一轮 C003/G007 按比例
+  // 应得 2.4 元被封顶 2 元，溢出 0.8 元第二轮平分给其余 4 卡，
+  // 最终 6 卡各 2 元、预算用尽
+  $("comp-station").value = "科技园";
+  $("comp-start").value = "2026-09-18 07:56:00";
+  $("comp-end").value = "2026-09-18 08:10:00";
+  $("comp-budget").value = "12.00";
+  $("comp-cap").value = "2.00";
 
   await saveConfig();
   await putText("/api/stations", DEMO.stations);
@@ -1926,6 +2054,7 @@ function bind() {
   $("btn-pass").addEventListener("click", runPassBacktest);
   $("btn-dispute").addEventListener("click", runDisputePreview);
   $("btn-dispute-copy").addEventListener("click", copyDisputeSummary);
+  $("btn-comp").addEventListener("click", runCompensationPreview);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);

@@ -51,8 +51,8 @@ _ACTION_ALIASES = {
 
 def _err(code: str, message: str, line: Optional[int] = None,
          card: Optional[str] = None, time: Optional[str] = None,
-         station: Optional[str] = None) -> dict:
-    """构造定位错误对象。行号 / 卡号 / 时刻 / 站点尽量补齐，便于定位。"""
+         station: Optional[str] = None, param: Optional[str] = None) -> dict:
+    """构造定位错误对象。行号 / 卡号 / 时刻 / 站点 / 参数名尽量补齐，便于定位。"""
     loc: dict = {}
     if line is not None:
         loc["line"] = line
@@ -62,6 +62,8 @@ def _err(code: str, message: str, line: Optional[int] = None,
         loc["time"] = time
     if station:
         loc["station"] = station
+    if param:
+        loc["param"] = param
     e: dict = {"code": code, "message": message}
     if loc:
         e["location"] = loc
@@ -2832,3 +2834,193 @@ def dispute_preview(stations: list[Station],
         ok=True, card=card, edits=applied,
         last_verified_at=last_verified_at,
         trips=trips, summary=summary)
+
+
+# ---------------------------------------------------------------------------
+# 服务中断补偿预览（只读：基于最近一次核验账单，不改记录与账单）
+# ---------------------------------------------------------------------------
+
+COMP_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+@dataclass
+class CompensationPreview:
+    """服务中断补偿预览结果。
+
+    ok=False 时 errors 为定位错误（COMP_BAD_STATION / CONFIG_BAD，
+    location.param 指明出错参数），不产出任何分配结果。
+    ok=True 时 cards 为按卡号排序的逐卡补偿（受影响行程数、实扣额、
+    补偿额、封顶标记），unallocated 为预算用尽或全部封顶后仍未分配的
+    金额（元）；无匹配账单时 cards 为空、unallocated 等于预算全额。
+    金额在计算层全程为整数分，输出时换算为元（两位小数）。
+    """
+    ok: bool
+    station: str = ""
+    start_time: str = ""
+    end_time: str = ""
+    budget: float = 0.0
+    per_card_cap: float = 0.0
+    last_verified_at: Optional[str] = None
+    trip_count: int = 0
+    card_count: int = 0
+    charged_total: float = 0.0
+    compensated_total: float = 0.0
+    uncompensated_total: float = 0.0
+    unallocated: float = 0.0
+    round_count: int = 0
+    cards: list[dict] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+
+
+def _parse_comp_time(value, param: str) -> tuple[Optional[datetime], Optional[dict]]:
+    """解析起止时刻参数（复用 parse_time 的格式集）；失败返回 CONFIG_BAD。"""
+    text = str(value).strip()
+    try:
+        return parse_time(text), None
+    except ValueError as ex:
+        return None, _err("CONFIG_BAD", str(ex), param=param)
+
+
+def _comp_amount(value, label: str, param: str) -> tuple[int, Optional[dict]]:
+    """金额参数（元）-> 整数分；非法时返回 CONFIG_BAD 定位错误。"""
+    if not _is_finite_number(value) or float(value) < 0:
+        return 0, _err(
+            "CONFIG_BAD",
+            f"{label}必须是不小于 0 的有限数字（元）：{value!r}", param=param)
+    return _cents_of(float(value)), None
+
+
+def compensation_preview(bills: list[dict],
+                         station,
+                         start_time,
+                         end_time,
+                         budget,
+                         per_card_cap,
+                         last_verified_at: Optional[str]
+                         ) -> CompensationPreview:
+    """服务中断补偿预览（全程只读：只读取最近一次核验生成的账单）。
+
+    - 从已保存账单中选出「进站或出站发生在指定站点、且对应刷卡时刻落在
+      闭区间 [start_time, end_time] 内」的行程，按卡汇总实扣额；
+      同一行程进出站均匹配时只计一次；
+    - 预算与金额均按整数分计算：先以各卡实扣额（分）为权重按比例分配，
+      每轮按最大余数法把该轮份额补齐为整数分（余数相同按卡号字典序），
+      再将超过 min(单卡上限, 该卡实扣额) 的份额封顶，溢出份额进入下一轮
+      向未封顶卡重新分配，直到预算用尽或全部卡封顶；
+    - 无匹配账单时返回空结果（cards 为空、未分配金额等于预算全额）；
+      站点为空、区间非法（无法解析或起始晚于结束）、金额非法（负数 /
+      非有限数字）返回定位错误（location.param 指明出错参数）。
+    """
+    errors: list[dict] = []
+    station_text = str(station).strip() if station is not None else ""
+    if not station_text:
+        errors.append(_err("COMP_BAD_STATION", "站点不能为空", param="station"))
+    start_t, e1 = _parse_comp_time(start_time, "start_time")
+    end_t, e2 = _parse_comp_time(end_time, "end_time")
+    if e1 is not None:
+        errors.append(e1)
+    if e2 is not None:
+        errors.append(e2)
+    if start_t is not None and end_t is not None and start_t > end_t:
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"起始时刻不能晚于结束时刻：{start_t.strftime(COMP_TIME_FMT)} ～ "
+            f"{end_t.strftime(COMP_TIME_FMT)}", param="start_time"))
+    budget_cents, e3 = _comp_amount(budget, "补偿预算", "budget")
+    if e3 is not None:
+        errors.append(e3)
+    cap_cents, e4 = _comp_amount(per_card_cap, "单卡上限", "per_card_cap")
+    if e4 is not None:
+        errors.append(e4)
+    if errors:
+        return CompensationPreview(ok=False, errors=errors)
+
+    # 1) 选出受影响行程：进站或出站发生在该站，且对应刷卡时刻落在闭区间内
+    per_card: dict[str, dict] = {}
+    trip_count = 0
+    for b in bills:
+        matched = (b["entry_station"] == station_text
+                   and start_t <= datetime.strptime(b["entry_time"], COMP_TIME_FMT)
+                   <= end_t)
+        if not matched:
+            matched = (b["exit_station"] == station_text
+                       and start_t <= datetime.strptime(b["exit_time"], COMP_TIME_FMT)
+                       <= end_t)
+        if not matched:
+            continue
+        slot = per_card.setdefault(b["card"], {"trips": 0, "charged": 0})
+        slot["trips"] += 1
+        slot["charged"] += _cents_of(b["charged_fare"])
+        trip_count += 1
+
+    charged_total = sum(s["charged"] for s in per_card.values())
+
+    # 2) 权重分配：每轮按实扣额（分）为权重比例分配，最大余数法补齐整数分，
+    #    超过 min(单卡上限, 该卡实扣额) 的份额封顶，溢出进入下一轮重分。
+    cards = sorted(per_card)
+    comp = {c: 0 for c in cards}
+    # 每卡有效上限：不超过该卡实扣额（补偿不会超过其实际支出）
+    eff_cap = {c: min(cap_cents, per_card[c]["charged"]) for c in cards}
+    active = {c for c in cards if per_card[c]["charged"] > 0}
+    remaining = budget_cents
+    rounds = 0
+    while remaining > 0 and active:
+        weight_total = sum(per_card[c]["charged"] for c in active)
+        # 本轮整数份额：floor(remaining * w / W)，余数从大到小逐卡补 1 分，
+        # 余数相同按卡号字典序；补齐总额恰为本轮 remaining（最大余数法）。
+        quota: list[tuple[int, str, int]] = []
+        for c in active:
+            w = per_card[c]["charged"]
+            exact = remaining * w
+            quota.append((-(exact % weight_total), c, exact // weight_total))
+        quota.sort()
+        apportion = {c: base for _rem, c, base in quota}
+        leftover = remaining - sum(apportion.values())
+        for _rem, c, _base in quota[:leftover]:
+            apportion[c] += 1
+        # 封顶：超过有效上限的份额截断，溢出累计到下一轮重新分配
+        excess = 0
+        for c in list(active):
+            take = apportion[c]
+            if comp[c] + take > eff_cap[c]:
+                take = eff_cap[c] - comp[c]
+                active.discard(c)
+            comp[c] += take
+            excess += apportion[c] - take
+        remaining = excess
+        rounds += 1
+
+    compensated_total = sum(comp.values())
+    card_rows: list[dict] = []
+    for c in cards:
+        charged = per_card[c]["charged"]
+        card_rows.append({
+            "card": c,
+            "trip_count": per_card[c]["trips"],
+            "charged_total": _yuan_of(charged),
+            "compensation": _yuan_of(comp[c]),
+            "uncompensated": _yuan_of(charged - comp[c]),
+            "effective_cap": _yuan_of(eff_cap[c]),
+            "capped": comp[c] >= eff_cap[c] and eff_cap[c] > 0,
+            "cap_reason": ("cap" if cap_cents <= charged else "charged")
+                          if eff_cap[c] > 0 and comp[c] >= eff_cap[c]
+                          else None,
+        })
+
+    return CompensationPreview(
+        ok=True,
+        station=station_text,
+        start_time=start_t.strftime(COMP_TIME_FMT),
+        end_time=end_t.strftime(COMP_TIME_FMT),
+        budget=_yuan_of(budget_cents),
+        per_card_cap=_yuan_of(cap_cents),
+        last_verified_at=last_verified_at,
+        trip_count=trip_count,
+        card_count=len(card_rows),
+        charged_total=_yuan_of(charged_total),
+        compensated_total=_yuan_of(compensated_total),
+        uncompensated_total=_yuan_of(charged_total - compensated_total),
+        unallocated=_yuan_of(budget_cents - compensated_total),
+        round_count=rounds,
+        cards=card_rows,
+    )

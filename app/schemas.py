@@ -117,3 +117,18 @@ class DisputePreviewIn(BaseModel):
     """
     edits: list[DisputeEditIn] = Field(
         description="更正列表：1～2 笔同一卡记录的临时修改")
+
+
+class CompensationPreviewIn(BaseModel):
+    """服务中断补偿预览参数。
+
+    不在此处做数值约束：站点、起止时刻与金额的合法性均走核心层校验，
+    返回与其他接口一致的定位错误（HTTP 422，location.param 指明出错参数）。
+    """
+    station: str = Field(description="发生服务中断的站点名")
+    start_time: str = Field(
+        description="中断开始时刻（闭区间起点），如 2026-09-18 08:00:00")
+    end_time: str = Field(
+        description="中断结束时刻（闭区间终点），如 2026-09-18 09:00:00")
+    budget: float = Field(description="补偿预算（元），不小于 0")
+    per_card_cap: float = Field(description="单卡补偿上限（元），不小于 0")
