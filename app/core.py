@@ -2832,3 +2832,247 @@ def dispute_preview(stations: list[Station],
         ok=True, card=card, edits=applied,
         last_verified_at=last_verified_at,
         trips=trips, summary=summary)
+
+
+# ---------------------------------------------------------------------------
+# 服务中断补偿预览（只读：基于最近一次核验账单，不改任何数据）
+# ---------------------------------------------------------------------------
+
+# 补偿预览时刻的展示格式（与 Swipe.time_text 一致，精确到秒）
+COMP_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+# 定位错误中各输入字段的中文名（location.field -> 中文标签）
+_COMP_FIELD_LABELS = {
+    "station": "站点",
+    "start_time": "起始时刻",
+    "end_time": "结束时刻",
+    "budget": "补偿预算",
+    "per_card_cap": "单卡上限",
+    "time_range": "时间区间",
+}
+
+
+@dataclass
+class CompensationPreview:
+    """服务中断补偿预览结果。
+
+    参数非法（站点为空、起止时刻无法解析 / 起始晚于结束、预算或单卡上限
+    为负 / 非有限数字 / 超过分精度）时 ok=False，errors 携带带字段定位的
+    CONFIG_BAD 错误，不产出任何结果。
+    ok=True 时 cards 按卡号升序列出每张受影响卡的受影响行程数、实扣额、
+    补偿额与是否封顶；unallocated 为预算中未能分配的部分（全部卡封顶
+    仍有余款时为正）。无匹配账单时 cards 为空，预算全额计入未分配。
+    """
+    ok: bool
+    station: str = ""
+    start_time: str = ""
+    end_time: str = ""
+    budget: float = 0.0
+    per_card_cap: float = 0.0
+    last_verified_at: Optional[str] = None
+    trip_count: int = 0
+    card_count: int = 0
+    charged_total: float = 0.0
+    allocated_total: float = 0.0
+    unallocated: float = 0.0
+    cards: list[dict] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+
+
+def _config_field_err(message: str, field_name: str, **extra) -> dict:
+    """构造带输入字段定位的 CONFIG_BAD 错误。
+
+    location.field 给出字段标识，location.field_label 给出其中文名；
+    起止顺序错误时额外带上两侧的输入值，便于直接定位。
+    """
+    loc: dict = {"field": field_name,
+                 "field_label": _COMP_FIELD_LABELS.get(field_name, field_name)}
+    loc.update(extra)
+    return {"code": "CONFIG_BAD", "message": message, "location": loc}
+
+
+def _parse_cents_param(value, field_name: str, label: str
+                       ) -> tuple[Optional[int], Optional[dict]]:
+    """解析金额参数（元）为整数分。
+
+    合法：有限数字、不小于 0、最多精确到分（两位小数）。
+    返回 (整数分, None)；非法时返回 (None, 带字段定位的 CONFIG_BAD)。
+    """
+    if not _is_finite_number(value):
+        return None, _config_field_err(
+            f"{label}必须是不小于 0 的有限数字（元），实际：{value!r}",
+            field_name)
+    cents = int(round(float(value) * 100))
+    if abs(float(value) * 100 - cents) > 1e-6:
+        return None, _config_field_err(
+            f"{label}最多精确到分（两位小数）：{value!r}", field_name)
+    if cents < 0:
+        return None, _config_field_err(
+            f"{label}不能为负数：{value!r}", field_name)
+    return cents, None
+
+
+def _allocate_compensation(weights: dict[str, int],
+                           caps: dict[str, int],
+                           budget: int) -> dict[str, int]:
+    """按实扣额权重的封顶补偿分配（全程整数分）。
+
+    weights[card] 为各卡实扣额（分），caps[card] 为该卡补偿上限
+    （= min(单卡上限, 该卡实扣额)，分），budget 为待分配预算（分）。
+
+    迭代分配，每轮：
+      1. 对全部**未封顶**卡，以实扣额为权重按比例分配当前剩余预算，
+         各卡先取份额下取整，再把余下的整数分逐分发给**小数余数最大**的
+         卡；余数相同按卡号升序（最大余数法，每卡至多补 1 分）；
+      2. 份额超过该卡剩余封顶空间的部分被封顶截留，返还预算池；
+         被封顶卡退出下一轮，截留额只在剩余未封顶卡间重新分配。
+    直到预算用尽或全部卡封顶。每张被封顶卡离开时至少带走 1 分（其权重
+    与剩余空间均为正），因此轮数不超过卡数，必然终止。
+    """
+    allocated = {card: 0 for card in weights}
+    remaining = budget
+    active = [card for card in weights if caps[card] > 0]
+    while remaining > 0 and active:
+        total_w = sum(weights[c] for c in active)
+        floors: dict[str, int] = {}
+        remainders: dict[str, float] = {}
+        for card in active:
+            scaled = remaining * weights[card]
+            floors[card] = scaled // total_w
+            remainders[card] = scaled / total_w - floors[card]
+        leftover = remaining - sum(floors.values())
+        # 最大余数法：余数降序，余数相同卡号升序；每卡至多补 1 分
+        ranked = sorted(active, key=lambda c: (-remainders[c], c))
+        shares = dict(floors)
+        for card in ranked[:leftover]:
+            shares[card] += 1
+
+        still_active: list[str] = []
+        for card in active:
+            room = caps[card] - allocated[card]
+            got = min(shares[card], room)
+            allocated[card] += got
+            remaining -= got
+            if allocated[card] < caps[card]:
+                still_active.append(card)
+        active = still_active
+    return allocated
+
+
+def compensation_preview(bills: list[dict],
+                         station, start_time, end_time,
+                         budget, per_card_cap,
+                         last_verified_at: Optional[str]) -> CompensationPreview:
+    """服务中断补偿预览（全程只读：只读取最近一次核验生成的账单）。
+
+    - 从**已保存账单**中选出**进站或出站发生在指定站点**、且对应刷卡时刻
+      （进站对应进站时刻、出站对应出站时刻）落在 [起始时刻, 结束时刻]
+      **闭区间**内的行程；同一行程两侧都在该站且任一侧时刻在区间内只计 1 程；
+    - 按卡汇总受影响行程数与实扣额（charged_fare）；预算、单卡上限与各
+      金额一律换算为整数分，经 _allocate_compensation 分配：以各卡实扣额
+      为权重按比例分配，超过「单卡上限」或「该卡实扣额」的份额被封顶并向
+      未封顶卡重新分配，每轮按最大余数补齐整数分，余数相同按卡号升序，
+      直到预算用尽或全部封顶；
+    - 无匹配账单时正常返回空结果（cards 为空，预算全额计入未分配），
+      不视为错误；参数非法（站点为空、时刻无法解析 / 起止颠倒、预算或
+      单卡上限为负 / 超过分精度）返回带字段定位的 CONFIG_BAD。
+    """
+    errors: list[dict] = []
+
+    station_text = str(station).strip() if station is not None else ""
+    if not station_text:
+        errors.append(_config_field_err("站点不能为空", "station"))
+
+    start_text = str(start_time).strip() if start_time is not None else ""
+    end_text = str(end_time).strip() if end_time is not None else ""
+    t_start: Optional[datetime] = None
+    t_end: Optional[datetime] = None
+    try:
+        if not start_text:
+            raise ValueError("起始时刻不能为空")
+        t_start = parse_time(start_text)
+    except ValueError:
+        errors.append(_config_field_err(
+            f"起始时刻无法识别：{start_time!r}"
+            "（示例 2026-09-18 08:00:00）", "start_time"))
+    try:
+        if not end_text:
+            raise ValueError("结束时刻不能为空")
+        t_end = parse_time(end_text)
+    except ValueError:
+        errors.append(_config_field_err(
+            f"结束时刻无法识别：{end_time!r}"
+            "（示例 2026-09-18 10:00:00）", "end_time"))
+    if t_start is not None and t_end is not None and t_start > t_end:
+        errors.append(_config_field_err(
+            f"起始时刻不能晚于结束时刻：{t_start.strftime(COMP_TIME_FMT)}"
+            f" ～ {t_end.strftime(COMP_TIME_FMT)}",
+            "time_range", start_time=start_text, end_time=end_text))
+
+    budget_cents, e_budget = _parse_cents_param(budget, "budget", "补偿预算")
+    cap_cents, e_cap = _parse_cents_param(
+        per_card_cap, "per_card_cap", "单卡上限")
+    if e_budget is not None:
+        errors.append(e_budget)
+    if e_cap is not None:
+        errors.append(e_cap)
+    if errors:
+        return CompensationPreview(ok=False, errors=errors)
+
+    # 从已保存账单中筛选受影响行程（同一行程至多计 1 程）：
+    # 进站在指定站且进站时刻落入闭区间，或出站在指定站且出站时刻落入闭区间。
+    per_card: dict[str, dict] = {}
+    trip_count = 0
+    for b in bills:
+        hit = False
+        if b["entry_station"] == station_text:
+            entry_t = datetime.strptime(b["entry_time"], COMP_TIME_FMT)
+            if t_start <= entry_t <= t_end:
+                hit = True
+        if not hit and b["exit_station"] == station_text:
+            exit_t = datetime.strptime(b["exit_time"], COMP_TIME_FMT)
+            if t_start <= exit_t <= t_end:
+                hit = True
+        if not hit:
+            continue
+        trip_count += 1
+        slot = per_card.setdefault(
+            b["card"], {"trips": 0, "charged_cents": 0})
+        slot["trips"] += 1
+        slot["charged_cents"] += _cents_of(b["charged_fare"])
+
+    weights = {card: v["charged_cents"] for card, v in per_card.items()}
+    caps = {card: min(cap_cents, w) for card, w in weights.items()}
+    allocated = _allocate_compensation(weights, caps, budget_cents)
+    allocated_total = sum(allocated.values())
+
+    card_rows: list[dict] = []
+    for card in sorted(per_card):
+        charged = weights[card]
+        comp = allocated[card]
+        # 实扣为 0 的卡有效上限即 0，不存在「被封顶」的分配动作
+        capped = caps[card] > 0 and comp >= caps[card]
+        card_rows.append({
+            "card": card,
+            "trip_count": per_card[card]["trips"],
+            "charged": _yuan_of(charged),
+            "cap": _yuan_of(caps[card]),
+            "compensation": _yuan_of(comp),
+            "capped": capped,
+        })
+
+    return CompensationPreview(
+        ok=True,
+        station=station_text,
+        start_time=t_start.strftime(COMP_TIME_FMT),
+        end_time=t_end.strftime(COMP_TIME_FMT),
+        budget=_yuan_of(budget_cents),
+        per_card_cap=_yuan_of(cap_cents),
+        last_verified_at=last_verified_at,
+        trip_count=trip_count,
+        card_count=len(card_rows),
+        charged_total=_yuan_of(sum(weights.values())),
+        allocated_total=_yuan_of(allocated_total),
+        unallocated=_yuan_of(budget_cents - allocated_total),
+        cards=card_rows,
+    )

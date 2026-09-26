@@ -117,3 +117,19 @@ class DisputePreviewIn(BaseModel):
     """
     edits: list[DisputeEditIn] = Field(
         description="更正列表：1～2 笔同一卡记录的临时修改")
+
+
+class CompensationPreviewIn(BaseModel):
+    """服务中断补偿预览参数。
+
+    不在此处做数值约束：非法站点 / 时间区间 / 金额均走核心层校验，
+    返回带字段定位的 CONFIG_BAD 错误（HTTP 422）。
+    """
+    station: str = Field(description="中断站点名（账单行程进站或出站发生在该站）")
+    start_time: str = Field(
+        description="起始时刻 YYYY-MM-DD HH:MM[:SS]（闭区间，含边界）")
+    end_time: str = Field(
+        description="结束时刻 YYYY-MM-DD HH:MM[:SS]（闭区间，含边界）")
+    budget: float = Field(description="补偿预算（元，不小于 0，最多两位小数）")
+    per_card_cap: float = Field(
+        description="单卡补偿上限（元，不小于 0，最多两位小数）")

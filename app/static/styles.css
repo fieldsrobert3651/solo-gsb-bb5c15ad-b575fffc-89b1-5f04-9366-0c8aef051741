@@ -461,3 +461,6 @@ tr.gq-peak td { background: #fff7e6; }
 td.cell-changed { background: #fff4df; font-weight: 600; }
 tr.dispute-added td { background: #eaf7ee !important; }
 tr.dispute-removed td { background: #fdeeec !important; }
+
+/* ---------------- 服务中断补偿预览 ---------------- */
+tr.comp-capped td { background: #fdf3e3; }

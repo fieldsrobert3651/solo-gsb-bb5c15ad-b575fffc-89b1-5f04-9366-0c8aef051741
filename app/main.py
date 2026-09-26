@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from . import db
 from .core import (
     Config,
+    compensation_preview,
     dispute_preview,
     duration_audit,
     external_merge_preview,
@@ -31,6 +32,7 @@ from .core import (
     verify,
 )
 from .schemas import (
+    CompensationPreviewIn,
     ConfigIn,
     DisputePreviewIn,
     GateQueueIn,
@@ -55,7 +57,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -629,6 +631,52 @@ def run_dispute_preview(body: DisputePreviewIn):
         "edits": result.edits,
         "trips": result.trips,
         "summary": result.summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 服务中断补偿预览（只读：基于最近一次核验账单，不改任何数据）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/compensation-preview")
+def run_compensation_preview(body: CompensationPreviewIn):
+    """基于最近一次核验生成的账单，预览服务中断补偿在各卡间的分配。
+
+    - 从已保存账单中选出进站或出站发生在指定站点、且对应刷卡时刻落在
+      [起始时刻, 结束时刻] 闭区间内的行程，按卡汇总受影响行程数与实扣额；
+    - 预算与金额均按整数分计算：先以各卡实扣额为权重按比例分配，再将超过
+      单卡上限或该卡实扣额的份额封顶、向未封顶卡重新分配；每轮按最大余数
+      补齐整数分，余数相同按卡号升序，直到预算用尽或全部封顶；
+    - 无匹配账单时返回空结果（cards 为空，预算全额计入未分配）；
+      非法区间或金额返回 422 与带字段定位的 CONFIG_BAD；
+    - 全程只读：不修改记录和账单。
+    """
+    with db.connect() as conn:
+        bills = db.list_bills(conn)
+        last = db.get_meta(conn, "last_verified_at")
+    result = compensation_preview(
+        bills, body.station, body.start_time, body.end_time,
+        body.budget, body.per_card_cap, last)
+
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "station": result.station,
+        "start_time": result.start_time,
+        "end_time": result.end_time,
+        "budget": result.budget,
+        "per_card_cap": result.per_card_cap,
+        "last_verified_at": result.last_verified_at,
+        "trip_count": result.trip_count,
+        "card_count": result.card_count,
+        "charged_total": result.charged_total,
+        "allocated_total": result.allocated_total,
+        "unallocated": result.unallocated,
+        "cards": result.cards,
     }
 
 

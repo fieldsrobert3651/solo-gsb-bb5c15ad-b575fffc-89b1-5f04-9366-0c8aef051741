@@ -705,6 +705,64 @@ X999, 2026-09-18 08:10:00, 中心公园, 进"></textarea>
       </div>
     </section>
 
+    <!-- 服务中断补偿预览 -->
+    <section class="card" id="sec-compensation">
+      <h2>16. 服务中断补偿预览</h2>
+      <p class="hint">输入<strong>站点、起止时刻、补偿预算与单卡上限</strong>，系统从<strong>最近一次核验账单</strong>
+        （第 7 区）中选出<strong>进站或出站发生在该站</strong>、且对应刷卡时刻落在
+        <strong>闭区间 [起始, 结束]</strong> 内的行程，按卡汇总实扣额。预算与金额均按<strong>整数分</strong>计算：
+        先以各卡实扣额为权重按比例分配，再把超过<strong>单卡上限或该卡实扣额</strong>的份额封顶，
+        并向未封顶卡重新分配；每轮按<strong>最大余数</strong>补齐整数分，余数相同按卡号升序，
+        直到预算用尽或全部封顶。返回每卡受影响行程数、实扣额、补偿额及未分配金额；
+        无匹配账单时返回空结果。预览<strong>全程只读</strong>：不修改记录和账单。</p>
+      <div class="form-grid">
+        <label>中断站点（进站或出站发生在该站）
+          <input type="text" id="comp-station" placeholder="如 科技园" />
+        </label>
+        <label>起始时刻（含）
+          <input type="text" id="comp-start" placeholder="2026-09-18 00:00:00" />
+        </label>
+        <label>结束时刻（含）
+          <input type="text" id="comp-end" placeholder="2026-09-18 23:59:59" />
+        </label>
+      </div>
+      <div class="form-grid">
+        <label>补偿预算（元，≥0，最多两位小数）
+          <input type="number" id="comp-budget" min="0" step="0.01" placeholder="如 20.00" />
+        </label>
+        <label>单卡补偿上限（元，≥0，最多两位小数）
+          <input type="number" id="comp-cap" min="0" step="0.01" placeholder="如 5.00" />
+        </label>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" id="btn-compensation" type="button">💰 生成补偿预览</button>
+        <button class="btn btn-ghost" id="btn-comp-copy" type="button" hidden>📋 复制补偿明细</button>
+        <span id="comp-status" class="status"></span>
+      </div>
+
+      <div id="comp-errors" class="errors-panel" hidden>
+        <h3>❌ 无法生成补偿预览 —— 输入参数不合法（记录与账单均未改动）</h3>
+        <ul id="comp-errors-list"></ul>
+      </div>
+
+      <div id="comp-result" class="audit-result" hidden>
+        <div id="comp-summary" class="audit-summary"></div>
+
+        <div class="table-wrap">
+          <table id="comp-table">
+            <thead>
+              <tr>
+                <th>卡号</th><th>受影响行程数</th>
+                <th>实扣额（元）</th><th>本卡补偿上限（元）</th>
+                <th>补偿额（元）</th><th>状态</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <footer class="footer">
       FastAPI + SQLite + 原生前端 · 数据保存在容器 /data 卷 ·
       <a href="/docs" target="_blank">API 文档</a>
